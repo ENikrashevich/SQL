@@ -1,0 +1,227 @@
+﻿19 ВАРИАНТ
+
+
+
+
+CREATE OR ALTER FUNCTION GetTeacherSchedule(@TeacherName NVARCHAR(100))
+RETURNS TABLE
+AS
+RETURN
+(
+    WITH TeacherDays AS (
+        SELECT ISNULL(MAX(выходной), 0) as IsDayOff
+        FROM R3 
+        WHERE Учитель = @TeacherName
+    ),
+    LessonCounts AS (
+        SELECT 
+            [День недели],
+            COUNT(ID) as LessonCount
+        FROM R1
+        WHERE Учитель = @TeacherName
+        GROUP BY [День недели]
+    ),
+    AllDays AS (
+        SELECT 1 as [День недели], 'Понедельник' as DayName
+        UNION ALL SELECT 2, 'Вторник'
+        UNION ALL SELECT 3, 'Среда'
+        UNION ALL SELECT 4, 'Четверг'
+        UNION ALL SELECT 5, 'Пятница'
+    ),
+    FinalData AS (
+        SELECT 
+            ad.DayName,
+            CASE 
+                WHEN (SELECT IsDayOff FROM TeacherDays) = 1 THEN 'выходной'
+                ELSE CONCAT(ISNULL(lc.LessonCount, 0), ' уроков')
+            END as Значение
+        FROM AllDays ad
+        LEFT JOIN LessonCounts lc ON ad.[День недели] = lc.[День недели]
+    )
+    SELECT 
+        MAX(CASE WHEN DayName = 'Понедельник' THEN Значение END) as Понедельник,
+        MAX(CASE WHEN DayName = 'Вторник' THEN Значение END) as Вторник,
+        MAX(CASE WHEN DayName = 'Среда' THEN Значение END) as Среда,
+        MAX(CASE WHEN DayName = 'Четверг' THEN Значение END) as Четверг,
+        MAX(CASE WHEN DayName = 'Пятница' THEN Значение END) as Пятница
+    FROM FinalData
+)
+GO
+
+
+
+
+
+
+select* from GetTeacherSchedule('Воробьев')
+
+
+
+
+
+
+CREATE OR ALTER PROCEDURE TransferBooks
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @ТекущаяДата DATE = GETDATE();
+    DECLARE @НовыйНомерЗаказа INT;
+    
+    BEGIN TRANSACTION;
+    
+    BEGIN TRY
+        SELECT @НовыйНомерЗаказа = ISNULL(MAX([№ заказа]), 0) + 1 
+        FROM [Заказы];
+        INSERT INTO [Заказы] (
+            [№ заказа], 
+            [Заказчик], 
+            [Дата поступления заказа], 
+            [Адрес заказчика], 
+            [Дата выполнения заказа]
+        )
+        VALUES (
+            @НовыйНомерЗаказа,
+            N'Детский дом',
+            @ТекущаяДата,
+            N'Детский дом',
+            @ТекущаяДата
+        );
+        INSERT INTO [Строки-заказа] (
+            [№ заказа], 
+            [№ контракта], 
+            [Количество]
+        )
+        SELECT 
+            @НовыйНомерЗаказа,
+            [№ контракта],
+            [Остаток тиража]
+        FROM [Книги]
+        WHERE [Остаток тиража] > 0 
+          AND [Остаток тиража] < 3;
+        UPDATE [Книги]
+        SET [Остаток тиража] = 0
+        WHERE [Остаток тиража] > 0 
+          AND [Остаток тиража] < 3;
+        
+        COMMIT TRANSACTION;
+
+
+        SELECT 
+            @НовыйНомерЗаказа as [Номер созданного заказа],
+            @ТекущаяДата as [Дата создания],
+            (SELECT COUNT(*) FROM [Строки-заказа] WHERE [№ заказа] = @НовыйНомерЗаказа) as [Книжных позиций],
+            (SELECT SUM([Количество]) FROM [Строки-заказа] WHERE [№ заказа] = @НовыйНомерЗаказа) as [Всего экземпляров]
+        
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+
+
+
+
+
+EXEC TransferBooks
+
+
+
+
+
+
+CREATE OR ALTER TRIGGER Check_R4_Constraints
+ON R4
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @Class NVARCHAR(50);
+    DECLARE @MaxLessonsPerDay INT;
+    DECLARE @MaxDayCost DECIMAL(10, 2);
+    DECLARE @ActualLessonsPerDay INT;
+    DECLARE @ActualDayCost DECIMAL(10, 2);
+    DECLARE @ErrorMsg NVARCHAR(1000);
+    DECLARE cur CURSOR FOR
+    SELECT [Класс], [Максимальное количество уроков в день], [Максимальная стоимость дня]
+    FROM inserted;
+    
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @Class, @MaxLessonsPerDay, @MaxDayCost;
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SELECT @ActualLessonsPerDay = MAX(DailyLessons)
+        FROM (
+            SELECT [Класс], [День недели], COUNT(*) as DailyLessons
+            FROM R1
+            WHERE [Класс] = @Class
+            GROUP BY [Класс], [День недели]
+        ) as ClassSchedule;
+        SELECT @ActualDayCost = MAX(DailyCost)
+        FROM (
+            SELECT 
+                r1.[Класс], 
+                r1.[День недели], 
+                SUM(COALESCE(r2.[Стоимость урока], 0)) as DailyCost
+            FROM R1 r1
+            LEFT JOIN R2 r2 ON r1.[Класс] = r2.[Класс] AND r1.[Предмет] = r2.[Предмет]
+            WHERE r1.[Класс] = @Class
+            GROUP BY r1.[Класс], r1.[День недели]
+        ) as ClassCosts;
+        SET @ActualLessonsPerDay = ISNULL(@ActualLessonsPerDay, 0);
+        SET @ActualDayCost = ISNULL(@ActualDayCost, 0);
+        IF @ActualLessonsPerDay > @MaxLessonsPerDay
+        BEGIN
+            SET @ErrorMsg = N'Класс "' + @Class + 
+                           N'" имеет ' + CAST(@ActualLessonsPerDay AS NVARCHAR) + 
+                           N' уроков в день, что превышает максимальное допустимое количество (' + 
+                           CAST(@MaxLessonsPerDay AS NVARCHAR) + N')';
+            RAISERROR(@ErrorMsg, 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END
+        
+        IF @ActualDayCost > @MaxDayCost
+        BEGIN
+            SET @ErrorMsg = N'Класс "' + @Class + 
+                           N'" имеет стоимость дня ' + CAST(@ActualDayCost AS NVARCHAR) + 
+                           N', что превышает максимальную допустимую стоимость (' + 
+                           CAST(@MaxDayCost AS NVARCHAR) + N')';
+            RAISERROR(@ErrorMsg, 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END
+        
+        FETCH NEXT FROM cur INTO @Class, @MaxLessonsPerDay, @MaxDayCost;
+    END
+    
+    CLOSE cur;
+    DEALLOCATE cur;
+END;
+
+
+
+
+UPDATE R4 
+SET [Максимальная стоимость дня] = 1500.00
+WHERE [Класс] = '10';
+
+
+
+
+
+
+INSERT INTO R4 ([Класс], [Максимальное количество уроков в день], [Максимальная стоимость дня])
+VALUES (10, 3, 2000.00);
+
+
+
+
+UPDATE R4 
+SET [Максимальное количество уроков в день] = 3
+WHERE [Класс] = 10;
